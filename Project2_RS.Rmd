@@ -1,0 +1,647 @@
+---
+title: "project 2 Recommender System"
+author: "Mehreen Ali Gillani"
+date: "2026-06-13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# R Markdown setup
+knitr::opts_chunk$set(
+  echo = TRUE,           # Show code
+  warning = FALSE,       # Hide warnings
+  message = FALSE,       # Hide messages
+  error = FALSE,         # Stop on errors
+  fig.align = "center",  # Center plots
+  fig.width = 10,        # Figure width
+  fig.height = 6,        # Figure height
+  out.width = "80%",     # Output width
+  cache = FALSE,         # Disable cache for reproducibility
+  comment = NA,          # Remove ## from output
+  results = "hold"       # Hold results until end of chunk
+)
+
+# Load all libraries at once
+library(recommenderlab)
+library(ggplot2)
+library(tidyverse)
+library(tm)
+library(proxy)
+library(jsonlite)
+
+# Set seed for reproducibility
+set.seed(123)
+
+# Custom ggplot theme
+theme_set(theme_minimal() + 
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.caption = element_text(hjust = 0, face = "italic"),
+    axis.title = element_text(face = "bold")
+  ))
+```
+
+## Introduction
+
+Recommender systems are essential tools for personalizing user experiences in platforms like Netflix, Amazon, and Spotify. This project implements and evaluates three recommendation approaches—User-User Collaborative Filtering, Item-Item Collaborative Filtering, and Content-Based Filtering—using the MovieLens 100k dataset. The content-based model is enhanced by fetching real movie plots from the OMDb API and applying TF-IDF vectorization. The goal is to compare algorithm performance using RMSE/MAE metrics and neighborhood size tuning, ultimately identifying the most accurate approach for movie recommendations.
+
+### Get and load data 
+
+```{r loadMovieData}
+# Load MovieLense and its metadata
+library(recommenderlab)
+
+data("MovieLense")
+data("MovieLenseMeta")  # This works - it's in the package
+
+# Check dimensions
+dim(MovieLense)        # 943 x 1664
+dim(MovieLenseMeta)    # Should be 1664 x 22
+
+```
+
+### Visualization 1: Rating Matrix Sample
+
+**Show a corner of the rating matrix to illustrate the data's sparsity.**
+```{r}
+# Visualize a 100x100 corner of the rating matrix
+image(MovieLense[1:100, 1:100], main = "100x100 Sample of Rating Matrix")
+```
+
+### Visualization 2: Rating Distribution
+**Understand how users typically rate movies.**
+
+```{r fig.width=10, fig.height=7, fig.align='center'}
+# Convert ratings to a vector and create a histogram
+rating_values <- as(MovieLense, "matrix") %>% as.vector()
+rating_df <- data.frame(rating = rating_values[!is.na(rating_values)])
+
+ggplot(rating_df, aes(x = rating)) +
+  geom_histogram(bins = 9, fill = "steelblue", color = "white") +
+  ggtitle("Distribution of Movie Ratings") +
+  xlab("Rating") +
+  ylab("Count") +
+  theme_minimal()
+```
+### Visualization 3: User Rating Activity
+
+**Show how many users are "heavy raters" vs. "light raters".**
+
+```{r}
+# Calculate number of ratings per user
+user_counts <- rowCounts(MovieLense)
+user_activity <- data.frame(n_ratings = user_counts)
+
+ggplot(user_activity, aes(x = n_ratings)) +
+  geom_histogram(bins = 30, fill = "darkorange", color = "white") +
+  ggtitle("Number of Ratings per User") +
+  xlab("Number of Movies Rated") +
+  ylab("Number of Users") +
+  theme_minimal()
+```
+
+
+### Create Evaluation Scheme
+
+**We need a consistent way to compare our algorithms. The evaluationScheme function handles this elegantly.**
+
+**I'll use a 90/10 train-test split and evaluate how well each algorithm predicts 5-star ratings (our definition of a "good" recommendation)**
+
+```{r}
+# Create an evaluation scheme
+eval_scheme <- evaluationScheme(MovieLense, 
+                                method = "split", 
+                                train = 0.9, 
+                                given = 15,  # Give the algorithm 15 known ratings
+                                goodRating = 5)  # Consider 5-star as "good"
+
+eval_scheme
+```
+The given = 15 parameter represents a realistic scenario where users have rated approximately 15 movies before receiving recommendations.
+
+### Build and Evaluate Collaborative Filtering Models
+
+Now for the core of this project. I'll implement and evaluate three different approaches.
+
+- 5a: User-User Collaborative Filtering (UBCF)
+
+**This finds users with similar taste patterns and recommends what similar users liked.**
+
+```{r}
+# Create UBCF model with cosine similarity
+model_ubcf <- Recommender(getData(eval_scheme, "train"), 
+                          method = "UBCF", 
+                          param = list(method = "cosine", nn = 25))
+
+model_ubcf
+```
+
+- 5b: Item-Item Collaborative Filtering (IBCF)
+
+**This finds items that are often liked by the same users and recommends items similar to what the user already likes.**
+
+```{r}
+# Create IBCF model
+model_ibcf <- Recommender(getData(eval_scheme, "train"), 
+                          method = "IBCF", 
+                          param = list(method = "cosine", k = 30))
+
+model_ibcf
+```
+
+
+
+### Experiment with Parameters
+
+**Lets explore how parameter choices affect performance. Running the evaluation with different k (neighborhood size) values .**
+
+```{r}
+# ============================================
+# PARAMETER TUNING
+# ============================================
+
+set.seed(123)
+
+# Parameters to test
+given_values <- c(5, 10, 15, 20, 30)
+k_values <- c(10, 25, 50, 100)
+
+# Store results with multiple metrics
+results <- expand.grid(given = given_values, k = k_values, 
+                       RMSE = NA, MAE = NA, MSE = NA)
+
+# Run experiments
+for (g in seq_along(given_values)) {
+  for (k_idx in seq_along(k_values)) {
+    
+    eval_scheme <- evaluationScheme(MovieLense, 
+                                    method = "split", 
+                                    train = 0.9, 
+                                    given = given_values[g], 
+                                    goodRating = 5)
+    
+    model <- Recommender(getData(eval_scheme, "train"), 
+                         method = "UBCF", 
+                         param = list(method = "cosine", nn = k_values[k_idx]))
+    
+    pred <- predict(model, getData(eval_scheme, "known"), type = "ratings")
+    
+    # Get all accuracy metrics
+    accuracy <- calcPredictionAccuracy(pred, getData(eval_scheme, "unknown"))
+    
+    # Store multiple metrics
+    results$RMSE[results$given == given_values[g] & results$k == k_values[k_idx]] <- accuracy["RMSE"]
+    results$MAE[results$given == given_values[g] & results$k == k_values[k_idx]] <- accuracy["MAE"]
+    results$MSE[results$given == given_values[g] & results$k == k_values[k_idx]] <- accuracy["RMSE"]^2
+  }
+}
+
+# ============================================
+# VISUALIZE ALL METRICS
+# ============================================
+
+# Reshape for plotting
+results_long <- pivot_longer(results, cols = c(RMSE, MAE, MSE), 
+                              names_to = "Metric", values_to = "Value")
+
+# Faceted line plot
+ggplot(results_long, aes(x = k, y = Value, color = factor(given), group = given)) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  facet_wrap(~ Metric, scales = "free_y") +
+  scale_color_discrete(name = "Given Ratings") +
+  ggtitle("UBCF Performance: Impact of Neighborhood Size and Given Ratings") +
+  xlab("Number of Neighbors (k)") +
+  ylab("Error Metric Value") +
+  theme_minimal()
+
+
+cat("\n=== BEST CONFIGURATIONS ===\n")
+
+# Get best row for each metric
+best_rmse <- results[which.min(results$RMSE), ]
+best_mae <- results[which.min(results$MAE), ]
+best_mse <- results[which.min(results$MSE), ]
+
+# Print each separately
+cat("Lowest RMSE:\n")
+cat("  Given:", best_rmse$given, "| k:", best_rmse$k, "| RMSE:", round(best_rmse$RMSE, 4), "\n\n")
+
+cat("Lowest MAE:\n")
+cat("  Given:", best_mae$given, "| k:", best_mae$k, "| MAE:", round(best_mae$MAE, 4), "\n\n")
+
+cat("Lowest MSE:\n")
+cat("  Given:", best_mse$given, "| k:", best_mse$k, "| MSE:", round(best_mse$MSE, 4), "\n")
+
+# ============================================
+# PRINT FULL TABLE (Clean Format)
+# ============================================
+
+cat("\n=== COMPLETE RESULTS (Sorted by RMSE) ===\n")
+results_sorted <- results[order(results$RMSE), ]
+print(results_sorted[, c("given", "k", "RMSE", "MAE", "MSE")], row.names = FALSE)
+
+```
+### What We Tested?
+
+We experimented with different scenarios: giving the algorithm 5, 10, 15, 20, or 30 known ratings per user, and using 10, 25, 50, or 100 neighbors to make predictions. The goal was to find the setup that makes the most accurate predictions.
+
+#### The Clear Winner
+
+- Best configuration: 30 known ratings + 100 neighbors
+
+- RMSE: 1.00 (average prediction error ~1 star)
+
+- MAE: 0.78 (typical miss is less than 1 star)
+**This is our gold standard, but it's unrealistic for real users.**
+
+
+More ratings = better predictions
+
+- Going from 5 to 30 known ratings cut prediction error by 25% (1.33 → 1.00)
+
+- This makes sense: the more we know about a user, the better we can recommend.
+
+More neighbors = better predictions
+
+Using 100 neighbors always beat using 10, regardless of how many ratings we had
+The improvement ranged from 15-25% across all scenarios
+
+#### Practical Reality Check
+
+While given=30, k=100 wins on paper, real users rarely rate 30 movies before expecting recommendations. The sweet spot for real-world use is:
+
+Recommended for production: given=15, k=100
+
+- RMSE: 1.11 (only 10% worse than the ideal)
+
+- Much more realistic for actual users
+
+- Still benefits from the larger neighborhood size
+
+**What to Avoid**
+
+Never use k=10 - it was consistently the worst performer, with RMSE as high as 1.33 even with 30 ratings.
+
+#### Bottom Line
+
+If you want the absolute best accuracy, use 30 ratings and 100 neighbors. But for a real recommendation system that users will actually interact with, 15 ratings and 100 neighbors gives you the best balance of accuracy and practicality.
+
+
+### Import libraries and define OMDb API key
+
+```{r}
+library(jsonlite)
+library(tidytext)
+library(tm)
+library(proxy)
+
+# Your API key (free from OMDb)
+api_key <- "" # Note: API key removed for privacy. Replace with your OMDb API key.
+
+```
+
+### Extract IMDb title from URLs
+
+
+```{r}
+# ============================================
+# FETCH MAXIMUM MOVIES 
+# ============================================
+
+
+# Download MovieLens metadata directly (bypasses recommenderlab)
+url <- "https://files.grouplens.org/datasets/movielens/ml-100k/u.item"
+movies_all <- read.table(url, sep = "|", quote = "", stringsAsFactors = FALSE, 
+                         fileEncoding = "latin1")
+
+# Add column names
+colnames(movies_all) <- c("movie_id", "title", "release_date", "video_release", 
+                           "imdb_url", "unknown", "Action", "Adventure", 
+                           "Animation", "Childrens", "Comedy", "Crime", 
+                           "Documentary", "Drama", "Fantasy", "FilmNoir", 
+                           "Horror", "Musical", "Mystery", "Romance", 
+                           "SciFi", "Thriller", "War", "Western")
+
+# Extract year and clean title
+movies_all$year <- as.numeric(sub(".*\\((\\d{4})\\).*", "\\1", movies_all$title))
+movies_all$clean_title <- sub(" \\(\\d{4}\\)", "", movies_all$title)
+
+cat("Total movies available:", nrow(movies_all), "\n")
+
+# ============================================
+# FETCH PLOTS (Limit to avoid API timeouts)
+# ============================================
+
+# Choose fetch size (adjust based on your time)
+# 200 movies = ~1 minute | 500 movies = ~2.5 minutes | 1000 = ~5 minutes
+FETCH_SIZE <- 500  # Change to nrow(movies_all) for all 1682 movies
+
+movies_subset <- movies_all[1:min(FETCH_SIZE, nrow(movies_all)), ]
+
+# Fetch function
+fetch_plot_by_title <- function(title, year, api_key) {
+  title_encoded <- gsub(" ", "+", title)
+  
+  url <- paste0("http://www.omdbapi.com/?apikey=", api_key, 
+                "&t=", title_encoded, "&y=", year, "&plot=full")
+  
+  result <- tryCatch({
+    fromJSON(url)
+  }, error = function(e) NULL)
+  
+  if (!is.null(result) && result$Response == "True") {
+    return(result$Plot)
+  } else {
+    return(NA)
+  }
+}
+
+# Test first movie
+test_plot <- fetch_plot_by_title(movies_subset$clean_title[1], movies_subset$year[1], api_key)
+cat("Test fetch for", movies_subset$title[1], ":\n")
+print(substr(test_plot, 1, 100))
+
+# Fetch plots with progress
+movies_subset$plot <- sapply(1:nrow(movies_subset), function(i) {
+  Sys.sleep(0.3)  # Rate limiting (respects API free tier)
+  if (i %% 50 == 0) cat("Progress:", i, "/", nrow(movies_subset), "movies\n")
+  fetch_plot_by_title(movies_subset$clean_title[i], movies_subset$year[i], api_key)
+})
+
+# Results
+fetched <- sum(!is.na(movies_subset$plot))
+cat("\n========================================\n")
+cat("Successfully fetched:", fetched, "out of", nrow(movies_subset), "movies\n")
+cat("Success rate:", round(fetched/nrow(movies_subset)*100, 1), "%\n")
+cat("========================================\n")
+
+# Keep only movies with plots
+movies_clean <- movies_subset[!is.na(movies_subset$plot), ]
+cat("Movies for analysis:", nrow(movies_clean), "\n")
+
+# ============================================
+# BUILD TF-IDF MATRIX
+# ============================================
+
+# Create document-term matrix
+dtm <- DocumentTermMatrix(Corpus(VectorSource(movies_clean$plot)),
+                          control = list(weighting = weightTfIdf,
+                                         tolower = TRUE,
+                                         removePunctuation = TRUE,
+                                         removeNumbers = TRUE,
+                                         stopwords = TRUE,
+                                         stripWhitespace = TRUE))
+
+# Remove empty documents
+empty_removal <- which(rowSums(as.matrix(dtm)) == 0)
+if (length(empty_removal) > 0) {
+  dtm <- dtm[-empty_removal, ]
+  movies_clean <- movies_clean[-empty_removal, ]
+  cat("Removed", length(empty_removal), "empty documents\n")
+}
+
+# Convert to matrix
+tfidf_matrix <- as.matrix(dtm)
+rownames(tfidf_matrix) <- movies_clean$title
+cat("\nFinal TF-IDF matrix:", dim(tfidf_matrix), "\n")
+
+# ============================================
+# COMPUTE SIMILARITY & RECOMMENDATIONS
+# ============================================
+
+sim_matrix <- as.matrix(simil(tfidf_matrix, method = "cosine"))
+rownames(sim_matrix) <- movies_clean$title
+colnames(sim_matrix) <- movies_clean$title
+
+# Recommend similar movies
+movie <- "Toy Story (1995)"
+if (movie %in% rownames(sim_matrix)) {
+  scores <- sort(sim_matrix[movie, ], decreasing = TRUE)
+  top10 <- names(scores[2:11])
+  cat("\nTop 10 similar to", movie, ":\n")
+  print(top10)
+}
+```
+### Comparison: Collaborative vs Content-Based Filtering
+
+#### Collaborative Filtering (User-User & Item-User)
+
+- "Users who liked Toy Story also liked similar movies based on rating patterns"
+
+- Requires historical user rating data
+
+- Suffers from cold-start problem (new users or items have no ratings)
+
+- Finds social patterns and behavioral similarities
+
+#### Content-Based Filtering (Our OMDb + TF-IDF Approach)
+
+- "Movies with similar plot descriptions to Toy Story based on TF-IDF vectors"
+
+- Uses only movie features (plots from OMDb API)
+
+- No cold-start problem - new movies can be recommended immediately
+
+- Finds semantic/textual patterns in movie descriptions
+
+### MODEL EVALUATION
+
+```{r}
+# ============================================
+#  CONTENT MODEL EVALUATION
+# ============================================
+
+
+set.seed(123)
+
+# Create evaluation scheme
+eval_scheme2 <- evaluationScheme(MovieLense, method = "split", train = 0.9, given = 15, goodRating = 5)
+
+# Get train/test matrices
+train_mat_raw <- as(getData(eval_scheme2, "train"), "matrix")
+test_mat_raw <- as(getData(eval_scheme2, "unknown"), "matrix")
+
+# Fix movie names - extract clean titles (remove year)
+clean_colnames <- sub(" \\(\\d{4}\\)", "", colnames(train_mat_raw))
+
+# Apply cleaned names
+colnames(train_mat_raw) <- clean_colnames
+colnames(test_mat_raw) <- clean_colnames
+
+# Fix sim_matrix names (remove year if present)
+clean_sim_names <- sub(" \\(\\d{4}\\)", "", rownames(sim_matrix))
+rownames(sim_matrix) <- clean_sim_names
+colnames(sim_matrix) <- clean_sim_names
+
+# Find common movies
+common_movies <- intersect(rownames(sim_matrix), colnames(test_mat_raw))
+cat("Common movies:", length(common_movies), "\n")
+
+# Subset matrices
+train_mat <- train_mat_raw[, common_movies]
+test_mat <- test_mat_raw[, common_movies]
+
+# Initialize storage
+errors <- c()
+abs_errors <- c()
+actuals <- c()
+predicted_ratings <- c()
+count <- 0
+
+# Prediction loop with debugging
+for (uid in 1:min(50, nrow(test_mat))) {
+  
+  # Find movies user rated in test set
+  test_rated <- which(!is.na(test_mat[uid, ]))
+  
+  if (length(test_rated) > 0) {
+    
+    for (movie_idx in test_rated[1:min(3, length(test_rated))]) {
+      movie <- common_movies[movie_idx]
+      actual <- test_mat[uid, movie_idx]
+      
+      # Find movies user rated in training
+      train_rated <- which(!is.na(train_mat[uid, ]))
+      
+      # Debug: Check conditions
+      if (length(train_rated) >= 3) {
+        if (movie %in% rownames(sim_matrix)) {
+          
+          sim_scores <- sim_matrix[movie, common_movies[train_rated]]
+          sim_scores <- sim_scores[!is.na(sim_scores)]
+          
+          if (length(sim_scores) > 0) {
+            if (sum(sim_scores, na.rm = TRUE) > 0) {
+              
+              train_vals <- train_mat[uid, common_movies[train_rated]]
+              valid <- !is.na(train_vals) & !is.na(sim_scores)
+              
+              if (sum(valid) >= 2) {
+                
+                # Weighted average prediction
+                pred <- weighted.mean(train_vals[valid], sim_scores[valid], na.rm = TRUE)
+                
+                # Store values (THIS WAS THE ISSUE - need to ensure numeric)
+                error_val <- as.numeric(pred - actual)
+                
+                errors <- c(errors, error_val^2)
+                abs_errors <- c(abs_errors, abs(error_val))
+                actuals <- c(actuals, as.numeric(actual))
+                predicted_ratings <- c(predicted_ratings, as.numeric(pred))
+                count <- count + 1
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+# Check if we have predictions
+cat("\nPredictions made:", count, "\n")
+
+# Calculate metrics ONLY if we have predictions
+if (count > 0 && length(errors) > 0) {
+  rmse_content <- sqrt(mean(errors, na.rm = TRUE))
+  mae_content <- mean(abs_errors, na.rm = TRUE)
+  mse_content <- mean(errors, na.rm = TRUE)
+  
+  cat("\n=== CONTENT MODEL RESULTS ===\n")
+  cat("RMSE:", round(rmse_content, 4), "\n")
+  cat("MAE:", round(mae_content, 4), "\n")
+  cat("MSE:", round(mse_content, 4), "\n")
+} else {
+  cat("\n=== NO VALID PREDICTIONS ===\n")
+  rmse_content <- mae_content <- mse_content <- NA
+}
+
+# ============================================
+# COLLABORATIVE MODELS
+# ============================================
+
+# User-User CF
+model_ubcf <- Recommender(getData(eval_scheme2, "train"), method = "UBCF", 
+                          param = list(method = "cosine", nn = 25))
+pred_ubcf <- predict(model_ubcf, getData(eval_scheme2, "known"), type = "ratings")
+acc_ubcf <- calcPredictionAccuracy(pred_ubcf, getData(eval_scheme2, "unknown"))
+
+# Item-Item CF
+model_ibcf <- Recommender(getData(eval_scheme2, "train"), method = "IBCF", 
+                          param = list(method = "cosine", k = 30))
+pred_ibcf <- predict(model_ibcf, getData(eval_scheme2, "known"), type = "ratings")
+acc_ibcf <- calcPredictionAccuracy(pred_ibcf, getData(eval_scheme2, "unknown"))
+
+# ============================================
+# FINAL RESULTS TABLE
+# ============================================
+
+results_final <- data.frame(
+  Model = c("User-User CF", "Item-Item CF", "Content-Based (354 movies)"),
+  RMSE = round(c(acc_ubcf["RMSE"], acc_ibcf["RMSE"], rmse_content), 4),
+  MAE = round(c(acc_ubcf["MAE"], acc_ibcf["MAE"], mae_content), 4),
+  MSE = round(c(acc_ubcf["RMSE"]^2, acc_ibcf["RMSE"]^2, mse_content), 4)
+)
+
+cat("\n========================================\n")
+cat("         FINAL RESULTS TABLE\n")
+cat("========================================\n")
+print(results_final)
+```
+
+```{r}
+# Final Comparison Bar Chart (Dynamic Values)
+final_plot <- data.frame(
+  Model = c("User-User CF", "Item-Item CF", "Content-Based (OMDb)"),
+  RMSE = c(acc_ubcf["RMSE"], acc_ibcf["RMSE"], rmse_content)
+)
+
+# Ensure no NA values
+final_plot <- final_plot[!is.na(final_plot$RMSE), ]
+
+# Create bar chart
+ggplot(final_plot, aes(x = Model, y = RMSE, fill = Model)) +
+  geom_bar(stat = "identity", width = 0.6) +
+  geom_text(aes(label = round(RMSE, 4)), vjust = -0.5, size = 4) +
+  scale_fill_manual(values = c("#2E86AB", "#A23B72", "#F18F01")) +
+  ggtitle("Final Model Performance Comparison (Lower RMSE is Better)") +
+  ylab("RMSE") +
+  xlab("Recommendation Algorithm") +
+  theme_minimal() +
+  theme(legend.position = "none", plot.title = element_text(hjust = 0.5, face = "bold"))
+```
+**Key Findings**
+
+- Content-Based outperformed both collaborative filters - 13.4% better RMSE than User-User CF
+
+- Item-Item CF performed worst - 72% higher error than Content-Based
+
+- Parameter tuning revealed - Larger neighborhood (k=100) and more known ratings (given=30) achieved best RMSE (1.004), but given=15 is more realistic
+
+- TF-IDF on OMDb plots effectively captures movie semantics for recommendation
+
+**Recommendation**
+
+- Deploy Content-Based Filtering with TF-IDF on movie plots for optimal accuracy, or User-User CF (k=100, given=15) for simpler implementation with competitive performance.
+
+**This project implemented and compared three recommendation algorithms on the MovieLens 100k dataset:**
+
+- User-User Collaborative Filtering - Finds similar users based on rating patterns
+
+- Item-Item Collaborative Filtering - Finds similar items based on user ratings
+
+- Content-Based Filtering - Uses TF-IDF on movie plots fetched from OMDb API to compute item similarity
+
+**Key experiments included:**
+
+- Fetching movie plots for 500 movies (72.4% success rate)
+
+- Building a 354 movie × 7,195 term TF-IDF matrix
+
+- Tuning neighborhood sizes (k=10 to 100) and known ratings (given=5 to 30)
+
+- Evaluating all models on identical train/test splits (90/10, given=15)
+
+
+-------------------------------------
